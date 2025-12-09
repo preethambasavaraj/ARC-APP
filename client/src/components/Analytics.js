@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'; // <-- 1. IMPORT useRef
+import React, { useState, useEffect, useRef } from 'react';
 import api from '../api';
 import { Line, Pie, Bar } from 'react-chartjs-2';
 import {
@@ -13,7 +13,7 @@ import {
     Legend,
     Title,
 } from 'chart.js';
-import './Analytics.css'; // This now points to your new, enhanced CSS
+import './Analytics.css';
 
 ChartJS.register(
     CategoryScale,
@@ -38,33 +38,30 @@ const Analytics = () => {
     const [dateRange, setDateRange] = useState({ startDate: '', endDate: '' });
     const [activeFilter, setActiveFilter] = useState('today');
 
-    // --- FIX: Add a ref to track the initial page load ---
-    const isInitialMount = useRef(true); // <-- 2. ADD THIS LINE
+    // Track initial mount to avoid first empty fetch
+    const isInitialMount = useRef(true);
 
-    // This hook correctly sets the default to 'today'
+    // Set default preset
     useEffect(() => {
         setDatePreset('today');
     }, []);
 
-    // --- FIX: This hook is modified with ONE check ---
     useEffect(() => {
-        // This 'if' statement is new.
-        // It BLOCKS the very first fetch (with empty dates), preventing the race condition.
-        if (isInitialMount.current && !dateRange.startDate) { // <-- 3. ADD THIS 'if' BLOCK
+        if (isInitialMount.current && !dateRange.startDate) {
             isInitialMount.current = false;
             return;
         }
 
-        // This line now only runs for "today" on the first load,
-        // and for all other clicks (Month, Year, Clear) after.
         fetchAnalyticsData(dateRange);
     }, [dateRange]);
 
     const fetchAnalyticsData = async (dates) => {
+        if (!dates.startDate || !dates.endDate) return;
+
         try {
             const params = { ...dates };
 
-            // Summary Cards
+            // Summary
             const summaryRes = await api.get('/analytics/summary', { params });
             setSummary(summaryRes.data);
 
@@ -108,11 +105,11 @@ const Analytics = () => {
                 }]
             });
 
-            // NEW: Daily Court Utilization Percentage
+            // Daily Court Utilization
             const utilizationRes = await api.get('/analytics/utilization-heatmap', { params });
             const courtsRes = await api.get('/courts');
             const totalCourts = courtsRes.data.length;
-            const operatingHours = 16; // Assuming 6 AM to 10 PM
+            const operatingHours = 16; // 6 AM to 10 PM
             const totalPossibleSlots = totalCourts * operatingHours;
 
             const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -138,7 +135,7 @@ const Analytics = () => {
                 }]
             });
 
-            // Booking Status Distribution
+            // Booking Status
             const statusRes = await api.get('/analytics/booking-status-distribution', { params });
             setBookingStatusData({
                 labels: statusRes.data.map(d => d.status),
@@ -229,6 +226,7 @@ const Analytics = () => {
                 startDate = new Date(today.getFullYear(), 0, 1).toISOString().slice(0, 10);
                 endDate = new Date(today.getFullYear(), 11, 31).toISOString().slice(0, 10);
                 break;
+            case 'clear':
             default:
                 startDate = '';
                 endDate = '';
@@ -239,7 +237,7 @@ const Analytics = () => {
     const handleDownloadLedger = async () => {
         try {
             const response = await api.get('/ledger/download', {
-                responseType: 'blob', // Important
+                responseType: 'blob',
             });
             const url = window.URL.createObjectURL(new Blob([response.data]));
             const link = document.createElement('a');
@@ -253,10 +251,8 @@ const Analytics = () => {
         }
     };
 
-    // --- ALL YOUR JSX IS UNCHANGED ---
     return (
         <div className="analytics-container">
-
             <div className="analytics-header">
                 <h1 className="analytics-title">Analytics Dashboard</h1>
                 <div className="download-ledger">
@@ -264,21 +260,51 @@ const Analytics = () => {
                 </div>
             </div>
 
-
-            {/* Filters (with new CSS classes) */}
+            {/* Filters */}
             <div className="filters">
-                <button className={filter-btn ${activeFilter === 'today' ? 'active' : ''}} onClick={() => setDatePreset('today')}>Today</button>
-                <button className={filter-btn ${activeFilter === 'month' ? 'active' : ''}} onClick={() => setDatePreset('month')}>This Month</button>
-                <button className={filter-btn ${activeFilter === 'year' ? 'active' : ''}} onClick={() => setDatePreset('year')}>This Year</button>
-                <input type="date" name="startDate" value={dateRange.startDate} onChange={handleDateRangeChange} className="filter-input" />
-                <input type="date" name="endDate" value={dateRange.endDate} onChange={handleDateRangeChange} className="filter-input" />
-                <button className="filter-btn clear-btn" onClick={() => setDatePreset('clear')}>Clear</button>
+                <button
+                    className={`filter-btn ${activeFilter === 'today' ? 'active' : ''}`}
+                    onClick={() => setDatePreset('today')}
+                >
+                    Today
+                </button>
+                <button
+                    className={`filter-btn ${activeFilter === 'month' ? 'active' : ''}`}
+                    onClick={() => setDatePreset('month')}
+                >
+                    This Month
+                </button>
+                <button
+                    className={`filter-btn ${activeFilter === 'year' ? 'active' : ''}`}
+                    onClick={() => setDatePreset('year')}
+                >
+                    This Year
+                </button>
+                <input
+                    type="date"
+                    name="startDate"
+                    value={dateRange.startDate}
+                    onChange={handleDateRangeChange}
+                    className="filter-input"
+                />
+                <input
+                    type="date"
+                    name="endDate"
+                    value={dateRange.endDate}
+                    onChange={handleDateRangeChange}
+                    className="filter-input"
+                />
+                <button
+                    className="filter-btn clear-btn"
+                    onClick={() => setDatePreset('clear')}
+                >
+                    Clear
+                </button>
             </div>
-            
-            {/* Stat Cards Grid (Replaces the slider) */}
+
+            {/* Stat Cards */}
             <div className="summary-cards">
-                
-                {/* Total Bookings Card */}
+                {/* Total Bookings */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(54, 162, 235, 0.2)' }}>
@@ -291,7 +317,7 @@ const Analytics = () => {
                     </div>
                 </div>
 
-                {/* Total Revenue Card */}
+                {/* Total Revenue */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(75, 192, 192, 0.2)' }}>
@@ -304,7 +330,7 @@ const Analytics = () => {
                     </div>
                 </div>
 
-                {/* Total Cancellations Card */}
+                {/* Total Cancellations */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(255, 99, 132, 0.2)' }}>
@@ -317,7 +343,7 @@ const Analytics = () => {
                     </div>
                 </div>
 
-                {/* Sports Offered Card */}
+                {/* Sports Offered */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(153, 102, 255, 0.2)' }}>
@@ -330,7 +356,7 @@ const Analytics = () => {
                     </div>
                 </div>
 
-                {/* Total Courts Card */}
+                {/* Total Courts */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(255, 159, 64, 0.2)' }}>
@@ -343,7 +369,7 @@ const Analytics = () => {
                     </div>
                 </div>
 
-                {/* Total Discount Card */}
+                {/* Total Discount */}
                 <div className="card">
                     <div className="stat-card-content">
                         <div className="stat-icon-container" style={{ backgroundColor: 'rgba(255, 206, 86, 0.2)' }}>
@@ -355,14 +381,67 @@ const Analytics = () => {
                         </div>
                     </div>
                 </div>
+
+                {/* Total Amount */}
+                <div className="card">
+                    <div className="stat-card-content">
+                        <div className="stat-icon-container" style={{ backgroundColor: 'rgba(75, 192, 192, 0.2)' }}>
+                            <span>💰</span>
+                        </div>
+                        <div className="stat-text">
+                            <h4>Total Amount</h4>
+                            <p>₹{summary.total_amount}</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Amount Received */}
+                <div className="card">
+                    <div className="stat-card-content">
+                        <div className="stat-icon-container" style={{ backgroundColor: 'rgba(102, 255, 102, 0.2)' }}>
+                            <span>💵</span>
+                        </div>
+                        <div className="stat-text">
+                            <h4>Amount Received</h4>
+                            <p>₹{summary.amount_received}</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Amount Pending */}
+                <div className="card">
+                    <div className="stat-card-content">
+                        <div className="stat-icon-container" style={{ backgroundColor: 'rgba(255, 159, 64, 0.2)' }}>
+                            <span>⏳</span>
+                        </div>
+                        <div className="stat-text">
+                            <h4>Amount Pending</h4>
+                            <p>₹{summary.amount_pending}</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Cancelled Revenue */}
+                <div className="card">
+                    <div className="stat-card-content">
+                        <div className="stat-icon-container" style={{ backgroundColor: 'rgba(201, 203, 207, 0.2)' }}>
+                            <span>💸</span>
+                        </div>
+                        <div className="stat-text">
+                            <h4>Cancelled Revenue</h4>
+                            <p>₹{summary.cancelled_revenue}</p>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            {/* Charts Grid (CSS applies styling) */}
+            {/* Charts */}
             <div className="charts-grid">
                 <div className="chart-card">
                     <h3>Bookings Over Time</h3>
                     {bookingsOverTime.labels && <Line data={bookingsOverTime} />}
                 </div>
+
                 <div className="chart-card">
                     <h3>Revenue by Sport</h3>
                     {revenueBySport.labels && <Pie data={revenueBySport} />}
@@ -370,8 +449,14 @@ const Analytics = () => {
 
                 <div className="chart-card">
                     <h3>Booking Status</h3>
-                    {bookingStatusData.labels && <Pie data={bookingStatusData} options={{ plugins: { legend: { position: 'top' } } }} />}
+                    {bookingStatusData.labels && (
+                        <Pie
+                            data={bookingStatusData}
+                            options={{ plugins: { legend: { position: 'top' } } }}
+                        />
+                    )}
                 </div>
+
                 <div className="chart-card">
                     <h3>Revenue by Payment Mode</h3>
                     {revenueByPaymentModeData.labels && <Pie data={revenueByPaymentModeData} />}
@@ -379,34 +464,44 @@ const Analytics = () => {
 
                 <div className="chart-card">
                     <h3>Staff Performance</h3>
-                    {staffPerformanceData.labels && <Bar data={staffPerformanceData} options={{ 
-                        responsive: true, 
-                        plugins: { 
-                            legend: { display: false }, 
-                            title: { display: true, text: 'Bookings Created per Staff Member' } 
-                        }
-                    }} />}
+                    {staffPerformanceData.labels && (
+                        <Bar
+                            data={staffPerformanceData}
+                            options={{
+                                responsive: true,
+                                plugins: {
+                                    legend: { display: false },
+                                    title: { display: true, text: 'Bookings Created per Staff Member' }
+                                }
+                            }}
+                        />
+                    )}
                 </div>
 
                 <div className="chart-card">
                     <h3>Court Utilization by Day</h3>
-                    {dailyUtilization.labels && <Bar data={dailyUtilization} options={{ 
-                        responsive: true, 
-                        plugins: { 
-                            legend: { display: false }, 
-                            title: { display: true, text: 'Percentage of Court Time Booked Daily' } 
-                        },
-                        scales: {
-                            y: {
-                                max: 100,
-                                ticks: {
-                                    callback: function(value) {
-                                        return value + '%'
+                    {dailyUtilization.labels && (
+                        <Bar
+                            data={dailyUtilization}
+                            options={{
+                                responsive: true,
+                                plugins: {
+                                    legend: { display: false },
+                                    title: { display: true, text: 'Percentage of Court Time Booked Daily' }
+                                },
+                                scales: {
+                                    y: {
+                                        max: 100,
+                                        ticks: {
+                                            callback: function (value) {
+                                                return value + '%';
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                    }} />}
+                            }}
+                        />
+                    )}
                 </div>
             </div>
         </div>

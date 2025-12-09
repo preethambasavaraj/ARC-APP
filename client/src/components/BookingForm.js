@@ -26,6 +26,7 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
     const [selectedAccessories, setSelectedAccessories] = useState([]);
     const [showAccessories, setShowAccessories] = useState(false);
     const [errors, setErrors] = useState({});
+    const [isSubmitting, setIsSubmitting] = useState(false);
 
     // --- Effects ---
     useEffect(() => {
@@ -54,19 +55,25 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
                         endTime,
                         slots_booked: slotsBooked
                     });
-                    let newTotalPrice = res.data.total_price || 0;
+                    let baseCourtPrice = res.data.total_price || 0; // This is the base court price from backend
 
+                    // Calculate total price from selected accessories
                     const accessoriesTotal = selectedAccessories.reduce((total, acc) => {
                         const accessoryDetails = accessories.find(a => a.id === acc.id);
                         return total + ((accessoryDetails?.price || 0) * acc.quantity);
                     }, 0);
-                    newTotalPrice += accessoriesTotal;
+                    
+                    // totalPrice to display (undiscounted court + accessories)
+                    const undiscountedTotalPrice = baseCourtPrice + accessoriesTotal;
+                    setTotalPrice(undiscountedTotalPrice); 
 
-                    setTotalPrice(newTotalPrice);
-
-                    const currentAmountPaid = parseFloat(amountPaid) || 0;
                     const currentDiscount = parseFloat(discountAmount) || 0;
-                    setBalance(newTotalPrice - currentDiscount - currentAmountPaid);
+                    // Effective total for balance calculation (discounted court + accessories)
+                    const effectiveTotalForBalance = (baseCourtPrice - currentDiscount) + accessoriesTotal;
+
+                    // Recalculate balance whenever price, discount, or amount paid changes
+                    const currentAmountPaid = parseFloat(amountPaid) || 0;
+                    setBalance(effectiveTotalForBalance - currentAmountPaid); // Balance uses the effective total
 
                 } catch (error) {
                     console.error("Error calculating price:", error);
@@ -89,6 +96,13 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
         const currentDiscount = parseFloat(discountAmount) || 0;
         setBalance(totalPrice - currentDiscount - currentAmountPaid);
     }, [amountPaid, discountAmount, totalPrice]);
+
+    useEffect(() => {
+        const selectedCourt = courts.find(c => c.id === parseInt(courtId));
+        if (selectedCourt && selectedCourt.capacity <= 1) {
+            setSlotsBooked(1);
+        }
+    }, [courtId, courts]);
 
     // --- Handlers ---
     const handleAmountChange = (setter) => (e) => setter(e.target.value);
@@ -126,12 +140,22 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
 
         if (amountPaid === '' || amountPaid === null) {
             newErrors.amountPaid = 'Amount paid is required.';
-        } else if (isNaN(amountPaid) || amountPaid < 0) {
-            newErrors.amountPaid = 'Please enter a valid amount.';
+        } else if (isNaN(amountPaid) || parseFloat(amountPaid) < 0) {
+            newErrors.amountPaid = 'Amount paid must be a positive number.';
+        } else if (parseFloat(amountPaid) > totalPrice) {
+            newErrors.amountPaid = 'Amount paid cannot exceed total price.';
+        }
+
+        if (discountAmount && (isNaN(discountAmount) || parseFloat(discountAmount) < 0)) {
+            newErrors.discountAmount = 'Discount must be a positive number.';
         }
 
         if ((discountAmount > 0) && !discountReason.trim()) {
             newErrors.discountReason = 'Discount reason is required when a discount is applied.';
+        }
+
+        if (paymentId && !/^[a-zA-Z0-9]+$/.test(paymentId)) {
+            newErrors.paymentId = 'Payment ID must be alphanumeric.';
         }
 
         if (customerEmail && !/\S+@\S+\.\S+/.test(customerEmail)) {
@@ -142,14 +166,35 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
             newErrors.courtId = 'Please select a court.';
         }
 
-        if (slotsBooked <= 0) {
-            newErrors.slotsBooked = 'Number of slots must be greater than 0.';
+        if (slotsBooked === '' || slotsBooked === null || isNaN(slotsBooked) || slotsBooked <= 0) {
+            newErrors.slotsBooked = 'Please enter a valid number of slots.';
         }
 
         setErrors(newErrors);
         return Object.keys(newErrors).length === 0;
     };
 
+
+    const resetForm = () => {
+        setCourtId('');
+        setCustomerName('');
+        setCustomerContact('');
+        setCustomerEmail('');
+        setAmountPaid('');
+        setTotalPrice(0);
+        setBalance(0);
+        setMessage('');
+        setSlotsBooked(1);
+        setDiscountAmount('');
+        setDiscountReason('');
+        setShowDiscount(false);
+        setSelectedAccessories([]);
+        setShowAccessories(false);
+        setErrors({});
+        setPaymentMethod('Cash');
+        setOnlinePaymentType('UPI');
+        setPaymentId('');
+    };
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -159,6 +204,7 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
             return;
         }
 
+        setIsSubmitting(true);
         setMessage('');
 
         const finalPaymentMethod = paymentMethod === 'Online' ? onlinePaymentType : paymentMethod;
@@ -184,18 +230,13 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
 
             setLastBooking(res.data);
             setIsConfirmationModalOpen(true);
-            setMessage('Booking created successfully!');
-
-            setCourtId(''); setCustomerName(''); setCustomerContact(''); setCustomerEmail('');
-            setAmountPaid(''); setDiscountAmount(''); setDiscountReason('');
-            setShowDiscount(false); setShowAccessories(false); setSelectedAccessories([]);
-            setPaymentMethod('Cash'); setOnlinePaymentType('UPI'); setPaymentId('');
-            setSlotsBooked(1);
-            setErrors({});
-
             onBookingSuccess();
+            resetForm();
+
         } catch (err) {
             setMessage(err.response?.data?.message || 'Error creating booking');
+        } finally {
+            setIsSubmitting(false);
         }
     };
 
@@ -219,17 +260,18 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
                     {errors.courtId && <p style={{ color: 'red', fontSize: '12px' }}>{errors.courtId}</p>}
                 </div>
 
-                {selectedCourtDetails?.sport_name?.toLowerCase() === 'swimming' && (
+                {selectedCourtDetails?.capacity > 1 && (
                     <div className="form-group">
                         <label>Number of People (Slots)</label>
-                        <input
-                            type="number"
-                            value={slotsBooked}
-                            onChange={(e) => setSlotsBooked(Math.max(1, parseInt(e.target.value) || 1))}
-                            min="1"
-                            required
-                        />
-                        {selectedCourtDetails.available_slots !== undefined && slotsBooked > selectedCourtDetails.available_slots && (
+                                                    <input
+                                                        type="number"
+                                                        value={slotsBooked}
+                                                        onChange={(e) => setSlotsBooked(e.target.value)}
+                                                        onWheel={(e) => e.currentTarget.blur()} // Blur to prevent scroll increment/decrement
+                                                        min="1"
+                                                        placeholder="Enter number of people"
+                                                        required
+                                                    />                        {selectedCourtDetails.available_slots !== undefined && slotsBooked > selectedCourtDetails.available_slots && (
                              <p style={{ color: 'red', fontSize: '12px', marginTop: '4px' }}>Exceeds capacity ({selectedCourtDetails.available_slots} available)</p>
                         )}
                         {errors.slotsBooked && <p style={{ color: 'red', fontSize: '12px' }}>{errors.slotsBooked}</p>}
@@ -254,85 +296,108 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
                     {errors.customerEmail && <p style={{ color: 'red', fontSize: '12px' }}>{errors.customerEmail}</p>}
                 </div>
 
-                 <div className="form-group">
-                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                        <input type="checkbox" checked={showAccessories} onChange={() => setShowAccessories(!showAccessories)} />
-                        Add Accessories
-                    </label>
-                 </div>
-                 {showAccessories && (
-                    <div className="form-group accessories-selector">
-                         <label>Select Accessories</label>
-                         <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px' }}>
-                            <select id="accessory-select-input" defaultValue="">
-                                 <option value="" disabled>Choose...</option>
-                                 {accessories.map(acc => (
-                                     <option key={acc.id} value={acc.id}>
-                                         {acc.name} - ₹{acc.price}
-                                     </option>
-                                 ))}
-                            </select>
-                            <button type="button" className="btn btn-secondary" style={{ flexShrink: 0, padding: '8px 12px', marginTop: 0 }}
-                                onClick={() => {
-                                    const selectEl = document.getElementById('accessory-select-input');
-                                    if (selectEl.value) {
-                                        handleAddSelectedAccessory(parseInt(selectEl.value));
-                                        selectEl.value = "";
-                                    }
-                                }}>
-                                Add
-                            </button>
-                         </div>
-                         {selectedAccessories.length > 0 && (
-                            <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: '14px' }}>
-                                {selectedAccessories.map((acc, index) => {
-                                    const details = accessories.find(a => a.id === acc.id);
-                                    return (
-                                        <li key={index} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
-                                            <span>{details?.name || 'Unknown'} (x{acc.quantity})</span>
-                                            <button type="button" onClick={() => handleRemoveAccessory(acc.id)} style={{ background: 'none', border: 'none', color: 'red', cursor: 'pointer', fontSize: '16px' }}>&times;</button>
-                                        </li>
-                                    );
-                                })}
-                            </ul>
-                         )}
+                 {!showAccessories ? (
+                    <div className="form-group">
+                        <button
+                            type="button"
+                            className="btn-add-discount" // Reusing the class for consistent styling
+                            onClick={() => setShowAccessories(true)}
+                        >
+                            + Add Accessories
+                        </button>
                     </div>
+                ) : (
+                    <>
+                        <div className="form-group accessories-selector">
+                             <label>Select Accessories</label>
+                             <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px' }}>
+                                <select id="accessory-select-input" defaultValue="">
+                                     <option value="" disabled>Choose...</option>
+                                     {accessories.map(acc => (
+                                         <option key={acc.id} value={acc.id}>
+                                             {acc.name} - ₹{acc.price}
+                                         </option>
+                                     ))}
+                                </select>
+                                <button type="button" className="btn btn-secondary" style={{ flexShrink: 0, padding: '8px 12px', marginTop: 0 }}
+                                    onClick={() => {
+                                        const selectEl = document.getElementById('accessory-select-input');
+                                        if (selectEl.value) {
+                                            handleAddSelectedAccessory(parseInt(selectEl.value));
+                                            selectEl.value = "";
+                                        }
+                                    }}>
+                                    Add
+                                </button>
+                             </div>
+                             {selectedAccessories.length > 0 && (
+                                <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: '14px' }}>
+                                    {selectedAccessories.map((acc, index) => {
+                                        const details = accessories.find(a => a.id === acc.id);
+                                        return (
+                                            <li key={index} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
+                                                <span>{details?.name || 'Unknown'} (x{acc.quantity})</span>
+                                                <button type="button" onClick={() => handleRemoveAccessory(acc.id)} style={{ background: 'none', border: 'none', color: 'red', cursor: 'pointer', fontSize: '16px' }}>&times;</button>
+                                            </li>
+                                        );
+                                    })}<button type="button" className="btn-link" onClick={() => {
+                                        setShowAccessories(false);
+                                        setSelectedAccessories([]);
+                                    }}>
+                                    - Clear Accessories
+                                </button>
+                                </ul>
+                             )}
+                        </div>
+                    </>
                 )}
 
                 <div className="form-group">
                     <label>Total Price</label>
-                    <input type="number" value={totalPrice.toFixed(2)} readOnly style={{ backgroundColor: '#e9ecef', fontWeight: 'bold' }} />
+                    <input type="number" value={totalPrice.toFixed(2)} readOnly onWheel={(e) => e.currentTarget.blur()} style={{ backgroundColor: '#e9ecef', fontWeight: 'bold' }} />
                 </div>
 
-                 <div className="form-group">
-                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                        <input type="checkbox" checked={showDiscount} onChange={() => setShowDiscount(!showDiscount)} />
-                         Add Discount
-                    </label>
-                 </div>
-                 {showDiscount && (
+               {!showDiscount ? (
+                    <div className="form-group">
+                        <button
+                            type="button"
+                            className="btn-add-discount"
+                            onClick={() => setShowDiscount(true)}
+                        >
+                            + Add Discount
+                        </button>
+                    </div>
+                ) : (
                     <>
                         <div className="form-group">
                             <label>Discount Amount</label>
-                            <input type="number" value={discountAmount} onChange={handleAmountChange(setDiscountAmount)} placeholder="0.00" />
+                            <input type="number" value={discountAmount} onChange={handleAmountChange(setDiscountAmount)} onWheel={(e) => e.currentTarget.blur()} placeholder="0.00" />
+                            {errors.discountAmount && <p style={{ color: 'red', fontSize: '12px' }}>{errors.discountAmount}</p>}
                         </div>
                         <div className="form-group">
                             <label>Discount Reason</label>
                             <input type="text" value={discountReason} onChange={handleAmountChange(setDiscountReason)} />
                             {errors.discountReason && <p style={{ color: 'red', fontSize: '12px' }}>{errors.discountReason}</p>}
                         </div>
+                        <button type="button" className="btn-link" onClick={() => {
+                            setShowDiscount(false);
+                            setDiscountAmount('');
+                            setDiscountReason('');
+                        }}>
+                            - Clear Discount
+                        </button>
                     </>
                 )}
 
                 <div className="form-group">
                     <label>Amount Paid</label>
-                    <input type="number" value={amountPaid} onChange={handleAmountChange(setAmountPaid)} placeholder="0.00" required />
+                    <input type="number" value={amountPaid} onChange={handleAmountChange(setAmountPaid)} onWheel={(e) => e.currentTarget.blur()} placeholder="0.00" required />
                     {errors.amountPaid && <p style={{ color: 'red', fontSize: '12px' }}>{errors.amountPaid}</p>}
                 </div>
 
                 <div className="form-group">
                     <label>Balance</label>
-                    <input type="number" value={balance.toFixed(2)} readOnly style={{ backgroundColor: '#e9ecef', fontWeight: 'bold' }} />
+                    <input type="number" value={balance.toFixed(2)} readOnly onWheel={(e) => e.currentTarget.blur()} style={{ backgroundColor: '#e9ecef', fontWeight: 'bold' }} />
                 </div>
 
                 <div className="form-group">
@@ -344,32 +409,42 @@ const BookingForm = ({ courts, selectedDate, startTime, endTime, onBookingSucces
                     </select>
                 </div>
 
-                {paymentMethod === 'Online' && (
+                {(paymentMethod === 'Online' || paymentMethod === 'Cheque') && (
                     <>
-                        <div className="form-group">
-                            <label>Online Payment Type</label>
-                             <select value={onlinePaymentType} onChange={handleAmountChange(setOnlinePaymentType)}>
-                                <option value="UPI">UPI</option>
-                                <option value="Card">Card</option>
-                            </select>
-                        </div>
+                        {paymentMethod === 'Online' && (
+                            <div className="form-group">
+                                <label>Online Payment Type</label>
+                                 <select value={onlinePaymentType} onChange={handleAmountChange(setOnlinePaymentType)}>
+                                    <option value="UPI">UPI</option>
+                                    <option value="Card">Card</option>
+                                    <option value="Net Banking">Net Banking</option>
+                                </select>
+                            </div>
+                        )}
                          <div className="form-group">
-                            <label>Payment ID</label>
+                            <label>Payment ID / Cheque ID</label>
                             <input type="text" value={paymentId} onChange={handleAmountChange(setPaymentId)} />
+                            {errors.paymentId && <p style={{ color: 'red', fontSize: '12px' }}>{errors.paymentId}</p>}
                         </div>
                     </>
                 )}
 
-                <button type="submit" className="btn btn-primary">
-                    Create Booking
+                <button type="submit" className="btn btn-primary" disabled={isSubmitting}>
+                    {isSubmitting ? 'Creating...' : 'Create Booking'}
                 </button>
             </form>
 
             {isConfirmationModalOpen && (
                 <ConfirmationModal
                     booking={lastBooking}
-                    onClose={() => setIsConfirmationModalOpen(false)}
-                    onCreateNew={() => setIsConfirmationModalOpen(false)}
+                    onClose={() => {
+                        setIsConfirmationModalOpen(false);
+                        setMessage('');
+                    }}
+                    onCreateNew={() => {
+                        setIsConfirmationModalOpen(false);
+                        setMessage('');
+                    }}
                 />
             )}
         </>

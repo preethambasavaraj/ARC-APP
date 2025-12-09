@@ -27,7 +27,7 @@ export const useActiveBookings = () => {
     const fetchAllBookings = useCallback(async () => {
         try {
             const res = await api.get(`/bookings/all`);
-            setAllBookings(Array.isArray(res.data) ? res.data : []);
+            setAllBookings(Array.isArray(res.data.bookings) ? res.data.bookings : []);
         } catch (error) {
             console.error("Error fetching all bookings:", error);
             setAllBookings([]);
@@ -106,20 +106,20 @@ export const useActiveBookings = () => {
             const endTime = parseTime(endTimeStr);
 
             if (bookingDate === today) {
-                let status = 'upcoming';
+                let displayStatus = 'upcoming';
                 if (now >= startTime && now <= endTime) {
-                    status = 'active';
+                    displayStatus = 'active';
                 } else if (now > endTime) {
-                    status = 'ended';
+                    displayStatus = 'ended';
                 }
 
-                if (status === 'active' || status === 'ended') {
-                    inProgress.push({ ...booking, status, startTime, endTime });
+                if (displayStatus === 'active' || displayStatus === 'ended') {
+                    inProgress.push({ ...booking, displayStatus, startTime, endTime });
                 } else {
-                    upcoming.push({ ...booking, status, startTime, endTime });
+                    upcoming.push({ ...booking, displayStatus, startTime, endTime });
                 }
             } else if (new Date(bookingDate) > new Date(today)) {
-                upcoming.push({ ...booking, status: 'upcoming', startTime, endTime });
+                upcoming.push({ ...booking, displayStatus: 'upcoming', startTime, endTime });
             }
         }
 

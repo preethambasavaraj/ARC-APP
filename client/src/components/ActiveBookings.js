@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom'; // Import useNavigate
 import { useActiveBookings } from '../hooks/useActiveBookings';
 import BookingDetailsModal from './BookingDetailsModal';
 import './ActiveBookings.css';
 
 const ActiveBookings = () => {
-    const { inProgress, upcoming, removeBooking, markAsCompletedAndClear } = useActiveBookings();
+    const { inProgress, upcoming, removeBooking } = useActiveBookings();
     const [selectedBooking, setSelectedBooking] = useState(null);
+    const navigate = useNavigate(); // Get navigate function
 
     const handleCardClick = (booking) => {
         setSelectedBooking(booking);
@@ -23,7 +25,7 @@ const ActiveBookings = () => {
         });
 
         return (
-            <div className={`active-booking-card ${booking.status}`} onClick={() => onCardClick(booking)}>
+            <div className={`active-booking-card ${booking.displayStatus}`} onClick={() => onCardClick(booking)}>
                 <div className="booking-info">
                     <span className="sport-name">{booking.sport_name}</span>
                     <span className="court-name">{booking.court_name}</span>
@@ -31,7 +33,7 @@ const ActiveBookings = () => {
                 <div className="booking-date">{formattedDate}</div>
                 <div className="booking-time">{booking.time_slot}</div>
                 <div className="customer-name">{booking.customer_name}</div>
-                {showClear && booking.status === 'ended' && (
+                {showClear && booking.displayStatus === 'ended' && (
                     <div className="ended-message">
                         Time has ended, inform customer.
                         {booking.payment_status === 'Completed' ? (
@@ -48,7 +50,7 @@ const ActiveBookings = () => {
                             <button 
                                 onClick={(e) => { 
                                     e.stopPropagation();
-                                    markAsCompletedAndClear(booking); 
+                                    navigate('/ledger', { state: { openBookingId: booking.id } });
                                 }} 
                                 className="clear-btn mark-completed-btn"
                             >
@@ -110,3 +112,4 @@ const ActiveBookings = () => {
 };
 
 export default ActiveBookings;
+

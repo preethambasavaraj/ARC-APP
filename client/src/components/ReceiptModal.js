@@ -18,24 +18,11 @@ const ReceiptModal = ({ booking, onClose }) => {
     const publicServerUrl = process.env.REACT_APP_RECIEPT_URL || 'http://localhost:5000'; 
     const receiptPdfUrl = `${publicServerUrl}/api/booking/${booking.id}/receipt.pdf`;
 
-    const handlePrint = () => {
-        const printContent = document.getElementById('receipt-content-to-print');
-        const windowUrl = 'Receipt';
-        const uniqueName = new Date().getTime();
-        const windowName = windowUrl + '_' + uniqueName;
-        const printWindow = window.open('', windowName, 'height=600,width=800');
-        printWindow.document.write(`<html><head><title>${windowUrl}</title>`);
-        printWindow.document.write('<link rel="stylesheet" href="ReceiptModal.css" type="text/css" />'); // Optional: link to your css
-        printWindow.document.write('</head><body>');
-        printWindow.document.write(printContent.innerHTML);
-        printWindow.document.write('</body></html>');
-        printWindow.document.close();
-        printWindow.focus();
-        setTimeout(() => {
-            printWindow.print();
-            printWindow.close();
-        }, 500);
-    };
+        const handlePrint = () => {
+
+            window.print();
+
+        };
 
     return (
         <div className="modal-overlay">
@@ -68,12 +55,24 @@ const ReceiptModal = ({ booking, onClose }) => {
                         )}
                         <div className="receipt-section">
                             <h3>Payment Details</h3>
-                            <p><strong>Total Amount:</strong> ₹{booking.total_price}</p>
+                            <p><strong>Total Amount:</strong> ₹{booking.original_price}</p>
                             <p><strong>Discount:</strong> ₹{booking.discount_amount || 0}</p>
                             <p><strong>Final Amount:</strong> ₹{booking.total_amount}</p>
                             <p><strong>Amount Paid:</strong> ₹{booking.amount_paid}</p>
                             <p><strong>Balance:</strong> ₹{booking.balance_amount}</p>
                             <p><strong>Payment Status:</strong> <span className={`status ${booking.payment_status}`}>{booking.payment_status}</span></p>
+                            {booking.payments && booking.payments.length > 0 && (
+                                <div>
+                                    <h4>Payment History:</h4>
+                                    <ul>
+                                        {booking.payments.map(payment => (
+                                            <li key={payment.id}>
+                                                ₹{payment.amount} via {payment.payment_mode} on {formatDate(payment.payment_date)} by {payment.username || 'N/A'}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
                         </div>
                         <div className="receipt-footer">
                              <div className="qr-code">

@@ -633,7 +633,8 @@ const Dashboard = ({ user }) => {
     const fetchBookingsForDate = useCallback(async () => {
         try {
             const res = await api.get(`/bookings/all`, { params: { date: selectedDate, ...filters } });
-            setBookings(Array.isArray(res.data) ? res.data : []); // Ensure it's an array
+            // The API now returns an object { bookings, totalPages }, so we need to access the bookings property.
+            setBookings(Array.isArray(res.data.bookings) ? res.data.bookings : []);
         } catch (err) {
             console.error("Error fetching bookings for date:", err);
             setBookings([]); // Set to empty array on error
@@ -674,6 +675,9 @@ const Dashboard = ({ user }) => {
             const data = JSON.parse(event.data);
             if (data.message === 'bookings_updated') {
                 fetchBookingsForDate();
+                fetchHeatmapData();
+            } else if (data.message === 'courts_updated') {
+                fetchAvailability();
                 fetchHeatmapData();
             }
         };
@@ -748,8 +752,8 @@ const Dashboard = ({ user }) => {
         }
     };
 
-    const timeSlots = useMemo(() => Array.from({ length: 16 }, (_, i) => {
-        const startHour = 6 + i;
+    const timeSlots = useMemo(() => Array.from({ length: 18 }, (_, i) => {
+        const startHour = 5 + i;
         const endHour = startHour + 1;
         const startTimeValue = `${String(startHour).padStart(2, '0')}:00`;
         const endTimeValue = `${String(endHour).padStart(2, '0')}:00`;
@@ -771,7 +775,7 @@ const Dashboard = ({ user }) => {
 
     return (
         <div className="dashboard-container">
-            <h2 className="dashboard-header">Bookings Dashboard</h2>
+            <h2 className="dashboard-header">Bookings Dashboard <br></br>Hi, {user.username}</h2>
 
             {/* Heatmap Section - Button Removed */}
             <div className="dashboard-card heatmap-card">
@@ -817,7 +821,7 @@ const Dashboard = ({ user }) => {
                                         <td style={{ color: court.is_available ? 'green' : 'red', fontWeight: '500' }}>
                                             {['Under Maintenance', 'Event', 'Tournament', 'Membership', 'Coaching'].includes(court.status) ? court.status : court.is_available ? (court.capacity > 1 ? `${court.available_slots} / ${court.capacity} available` : 'Available') : 'Engaged'}
                                         </td>
-                                        <td><CourtActions court={court} onStatusChange={handleCourtStatusChange} /></td>
+                                        <td><CourtActions court={court} onStatusChange={handleCourtStatusChange} user={user} /></td>
                                     </tr>
                                 ))}
                             </tbody>

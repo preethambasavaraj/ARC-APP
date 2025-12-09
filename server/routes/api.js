@@ -7,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const PDFDocument = require('pdfkit');
 
 const saltRounds = 10;
-const JWT_SECRET = process.env.JWT_SECRET || 'your_default_secret_key'; // Use environment variable for secret
+const JWT_SECRET = process.env.JWT_SECRET; // Use environment variable for secret
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -61,18 +61,55 @@ const isAdmin = (req, res, next) => {
     next();
 };
 
+const isPrivilegedUser = (req, res, next) => {
+    if (req.user.role !== 'admin' && req.user.role !== 'desk') {
+        return res.status(403).json({ message: 'Access denied' });
+    }
+    next();
+};
+
 const toMinutes = (timeStr) => {
-    const [time, modifier] = timeStr.split(' ');
-    let [hours, minutes] = time.split(':').map(Number);
+    if (!timeStr) return 0;
+    const parts = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (!parts) return 0;
+
+    let hours = parseInt(parts[1], 10);
+    const minutes = parseInt(parts[2], 10);
+    const modifier = parts[3] ? parts[3].toUpperCase() : null;
 
     if (modifier === 'PM' && hours < 12) {
         hours += 12;
-    }
-    if (modifier === 'AM' && hours === 12) { // Handle midnight case
+    } else if (modifier === 'AM' && hours === 12) {
         hours = 0;
     }
-    // If there's no modifier, it's already 24-hour format
     return hours * 60 + minutes;
+};
+
+const parseTimeTo24Hour = (timeStr) => {
+    if (!timeStr) return null;
+    const parts = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (!parts) return null;
+
+    let hours = parseInt(parts[1], 10);
+    const minutes = parseInt(parts[2], 10);
+    const modifier = parts[3] ? parts[3].toUpperCase() : null;
+
+    if (modifier === 'PM' && hours < 12) {
+        hours += 12;
+    } else if (modifier === 'AM' && hours === 12) {
+        hours = 0;
+    }
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+};
+
+const formatTo12Hour = (time24hStr) => {
+    if (!time24hStr) return '';
+    let [hours, minutes] = time24hStr.split(':').map(Number);
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12;
+    minutes = minutes < 10 ? '0' + minutes : minutes;
+    return `${hours}:${minutes} ${ampm}`;
 };
 
 const checkOverlap = (startA, endA, startB, endB) => {
@@ -83,9 +120,6 @@ const checkOverlap = (startA, endA, startB, endB) => {
 
     return startAMin < endBMin && endAMin > startBMin;
 };
-
-
-// Login
 router.post('/login', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -129,6 +163,27 @@ router.post('/admin/users', authenticateToken, isAdmin, async (req, res) => {
         if (err.code === 'ER_DUP_ENTRY') {
             return res.status(409).json({ message: 'Username already exists' });
         }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get all users (Admin only)
+router.get('/admin/users', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const [users] = await db.query('SELECT id, username, role FROM users');
+        res.json(users);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete a user (Admin only)
+router.delete('/admin/users/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM users WHERE id = ?', [id]);
+        res.json({ success: true, message: 'User deleted successfully' });
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -240,33 +295,18 @@ router.get('/bookings', authenticateToken, async (req, res) => {
     }
 });
 
-// Get all bookings (ledger)
+// Get all bookings (ledger) with pagination
 router.get('/bookings/all', authenticateToken, async (req, res) => {
+    let connection;
     try {
-        let { date, sport, customer, startTime, endTime, search } = req.query;
-        let queryParams = [];
-        let query = `
-            SELECT 
-                b.*, 
-                c.name as court_name, 
-                s.name as sport_name,
-                (b.total_price + b.discount_amount) as original_price,
-                b.total_price as total_amount,
-                u.username as created_by_user,
-                DATE_FORMAT(b.date, '%Y-%m-%d') as date,
-                b.is_rescheduled,
-                b.discount_amount,
-                b.discount_reason,
-                GROUP_CONCAT(JSON_OBJECT('name', a.name, 'quantity', ba.quantity, 'price', ba.price_at_booking)) as accessories
-            FROM bookings b 
-            LEFT JOIN booking_accessories ba ON b.id = ba.booking_id
-            LEFT JOIN accessories a ON ba.accessory_id = a.id
-            JOIN courts c ON b.court_id = c.id
-            JOIN sports s ON b.sport_id = s.id
-            LEFT JOIN users u ON b.created_by_user_id = u.id
-        `;
+        connection = await db.getConnection();
+        await connection.query('SET SESSION group_concat_max_len = 1000000;');
 
+        let { date, sport, customer, startTime, endTime, search, page = 1, limit = 10, status } = req.query;
+        let queryParams = [];
         let whereClauses = [];
+
+        // Build WHERE clauses
         if (date) {
             whereClauses.push('b.date = ?');
             queryParams.push(date);
@@ -280,11 +320,11 @@ router.get('/bookings/all', authenticateToken, async (req, res) => {
             queryParams.push(`%${customer}%`);
         }
         if (startTime) {
-            whereClauses.push("STR_TO_DATE(SUBSTRING_INDEX(b.time_slot, ' - ', 1), '%h:%i %p') >= STR_TO_DATE(?, '%h:%i %p')");
+            whereClauses.push("STR_TO_DATE(SUBSTRING_INDEX(b.time_slot, ' - ', 1), '%h:%i %p') >= STR_TO_DATE(?, '%H:%i')");
             queryParams.push(startTime);
         }
         if (endTime) {
-            whereClauses.push("STR_TO_DATE(SUBSTRING_INDEX(b.time_slot, ' - ', -1), '%h:%i %p') <= STR_TO_DATE(?, '%h:%i %p')");
+            whereClauses.push("STR_TO_DATE(SUBSTRING_INDEX(b.time_slot, ' - ', -1), '%h:%i %p') <= STR_TO_DATE(?, '%H:%i')");
             queryParams.push(endTime);
         }
         if (search) {
@@ -292,32 +332,95 @@ router.get('/bookings/all', authenticateToken, async (req, res) => {
             queryParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
         }
 
+        // Base query for counting total records
+        let countQuery = `
+            SELECT COUNT(b.id) as total
+            FROM bookings b
+            LEFT JOIN courts c ON b.court_id = c.id
+            LEFT JOIN sports s ON b.sport_id = s.id
+        `;
+
+        if (status === 'closed') {
+             whereClauses.push('b.status != ?');
+             queryParams.push('Cancelled');
+             whereClauses.push('b.payment_status = ?');
+             queryParams.push('Completed');
+             // This logic assumes a booking is "closed" if it's in the past and completed.
+             // We'll check the end time against the current time.
+             whereClauses.push(`STR_TO_DATE(CONCAT(b.date, ' ', SUBSTRING_INDEX(b.time_slot, ' - ', -1)), '%Y-%m-%d %h:%i %p') < NOW()`);
+        } else if (status === 'cancelled') {
+            whereClauses.push('b.status = ?');
+            queryParams.push('Cancelled');
+        } else if (status === 'active') {
+            whereClauses.push('b.status != ?');
+            queryParams.push('Cancelled');
+            whereClauses.push(`NOT (b.payment_status = 'Completed' AND STR_TO_DATE(CONCAT(b.date, ' ', SUBSTRING_INDEX(b.time_slot, ' - ', -1)), '%Y-%m-%d %h:%i %p') < NOW())`);
+        }
+
+
+        if (whereClauses.length > 0) {
+            countQuery += ' WHERE ' + whereClauses.join(' AND ');
+        }
+
+        const [countRows] = await connection.query(countQuery, queryParams);
+        const totalBookings = countRows[0].total;
+        const totalPages = Math.ceil(totalBookings / limit);
+
+        // Main query for fetching paginated data
+        let query = `
+            SELECT 
+                b.*, 
+                b.time_slot,
+                COALESCE(c.name, 'Deleted Court') as court_name, 
+                COALESCE(s.name, 'Deleted Sport') as sport_name,
+                (b.total_price + b.discount_amount) as original_price,
+                b.total_price as total_amount,
+                u.username as created_by_user,
+                DATE_FORMAT(b.date, '%Y-%m-%d') as date,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', a.id, 'name', a.name, 'quantity', ba.quantity, 'price', ba.price_at_booking)), ']')
+                    FROM booking_accessories ba
+                    JOIN accessories a ON ba.accessory_id = a.id
+                    WHERE ba.booking_id = b.id
+                ) as accessories,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', p.id, 'amount', p.amount, 'payment_mode', p.payment_mode, 'payment_date', p.payment_date, 'username', u.username, 'payment_id', p.payment_id)), ']')
+                    FROM payments p
+                    LEFT JOIN users u ON p.created_by_user_id = u.id
+                    WHERE p.booking_id = b.id
+                ) as payments
+            FROM bookings b 
+            LEFT JOIN courts c ON b.court_id = c.id
+            LEFT JOIN sports s ON b.sport_id = s.id
+            LEFT JOIN users u ON b.created_by_user_id = u.id
+        `;
+
         if (whereClauses.length > 0) {
             query += ' WHERE ' + whereClauses.join(' AND ');
         }
 
-        query += ' GROUP BY b.id ORDER BY b.date DESC';
+        query += ' ORDER BY b.id DESC LIMIT ? OFFSET ?';
+        const offset = (page - 1) * limit;
+        queryParams.push(parseInt(limit, 10), parseInt(offset, 10));
 
-        const [rows] = await db.query(query, queryParams);
+        const [rows] = await connection.query(query, queryParams);
         
-        const bookings = rows.map(row => {
-            if (row.accessories) {
-                try {
-                    // The GROUP_CONCAT with JSON_OBJECT returns a string that needs to be wrapped in an array and parsed.
-                    row.accessories = JSON.parse(`[${row.accessories}]`);
-                } catch (e) {
-                    console.error("Error parsing accessories JSON:", e);
-                    row.accessories = []; // Set to empty array on parsing error
-                }
-            } else {
-                row.accessories = []; // Set to empty array if no accessories
-            }
-            return row;
+        const bookings = rows.map(row => ({
+            ...row,
+            accessories: row.accessories ? JSON.parse(row.accessories) : [],
+            payments: row.payments ? JSON.parse(row.payments) : []
+        }));
+
+        res.json({
+            bookings,
+            totalPages
         });
 
-        res.json(bookings);
     } catch (err) {
+        console.error("Error fetching bookings:", err);
         res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
@@ -332,8 +435,8 @@ router.get('/availability/heatmap', authenticateToken, async (req, res) => {
         const [courts] = await db.query('SELECT c.id, c.name, c.status, s.name as sport_name, s.capacity FROM courts c JOIN sports s ON c.sport_id = s.id ORDER BY s.name, c.name');
         const [bookings] = await db.query('SELECT * FROM bookings WHERE date = ? AND status != ?', [date, 'Cancelled']);
 
-        const timeSlots = Array.from({ length: 16 }, (_, i) => {
-            const hour = 6 + i;
+        const timeSlots = Array.from({ length: 18 }, (_, i) => {
+            const hour = 5 + i;
             return `${String(hour).padStart(2, '0')}:00`;
         });
 
@@ -414,7 +517,7 @@ router.get('/bookings/active', authenticateToken, async (req, res) => {
             FROM bookings b 
             JOIN courts c ON b.court_id = c.id
             JOIN sports s ON b.sport_id = s.id
-            WHERE b.date = ?
+            WHERE b.date = ? OR (b.payment_status IN ('Pending', 'Received') AND b.status != 'Cancelled')
         `;
         const [bookings] = await db.query(query, [today]);
 
@@ -470,6 +573,8 @@ router.get('/booking/:id/receipt.pdf', async (req, res) => {
                 b.status as booking_status,
                 c.name as court_name,
                 s.name as sport_name,
+                (b.total_price + b.discount_amount) as original_price,
+                b.discount_amount,
                 b.total_price as total_amount,
                 u.username as created_by
             FROM bookings b
@@ -485,8 +590,14 @@ router.get('/booking/:id/receipt.pdf', async (req, res) => {
         const booking = rows[0];
 
         const [accessories] = await db.query('SELECT a.name, ba.quantity, ba.price_at_booking FROM booking_accessories ba JOIN accessories a ON ba.accessory_id = a.id WHERE ba.booking_id = ?', [id]);
+        const [payments] = await db.query(`
+            SELECT p.amount, p.payment_mode, DATE_FORMAT(p.payment_date, '%Y-%m-%d') as payment_date, u.username 
+            FROM payments p 
+            LEFT JOIN users u ON p.created_by_user_id = u.id 
+            WHERE p.booking_id = ?
+        `, [id]);
 
-        const doc = new PDFDocument({ size: 'A4', margin: 50 });
+        const doc = new PDFDocument({ size: [302, 400], margin: 10 });
         const buffers = [];
         doc.on('data', buffers.push.bind(buffers));
         doc.on('end', () => {
@@ -500,46 +611,52 @@ router.get('/booking/:id/receipt.pdf', async (req, res) => {
         });
 
         // Header
-        doc.fontSize(20).text('ARC SportsZone Booking Receipt', { align: 'center' });
+        doc.fontSize(14).text('ARC SportsZone', { align: 'center' });
+        doc.fontSize(8).text('Booking Receipt', { align: 'center' });
         doc.moveDown();
 
         // Booking Details
-        doc.fontSize(12).text(`Booking ID: ${booking.booking_id}`);
-        doc.text(`Date: ${booking.date}`);
-        doc.text(`Time: ${booking.time_slot}`);
-        doc.moveDown();
+        doc.fontSize(8).text(`ID: ${booking.booking_id} | Date: ${booking.date} | Time: ${booking.time_slot}`);
+        doc.moveDown(0.5);
 
         // Customer Details
-        doc.fontSize(14).text('Customer Details', { underline: true });
-        doc.fontSize(12).text(`Name: ${booking.customer_name}`);
-        doc.text(`Contact: ${booking.customer_contact}`);
-        doc.moveDown();
+        doc.fontSize(8).text(`Customer: ${booking.customer_name} | Contact: ${booking.customer_contact}`);
+        doc.moveDown(0.5);
         
         // Booking Info
-        doc.fontSize(14).text('Booking Information', { underline: true });
-        doc.fontSize(12).text(`Sport: ${booking.sport_name}`);
-        doc.text(`Court: ${booking.court_name}`);
+        doc.fontSize(8).text(`Sport: ${booking.sport_name} | Court: ${booking.court_name}`);
         doc.moveDown();
 
         // Accessories
         if (accessories.length > 0) {
-            doc.fontSize(14).text('Accessories', { underline: true });
+            doc.fontSize(10).text('Accessories', { underline: true });
             accessories.forEach(acc => {
-                doc.fontSize(12).text(`${acc.name} (x${acc.quantity}) - Rs. ${acc.price_at_booking * acc.quantity}`)
+                doc.fontSize(8).text(`${acc.name} (x${acc.quantity}) - Rs. ${acc.price_at_booking * acc.quantity}`)
             });
             doc.moveDown();
         }
 
         // Payment Details
-        doc.fontSize(14).text('Payment Details', { underline: true });
-        doc.fontSize(12).text(`Total Amount: Rs. ${booking.total_amount}`);
-        doc.text(`Amount Paid: Rs. ${booking.amount_paid}`);
-        doc.font('Helvetica-Bold').text(`Balance: Rs. ${booking.balance_amount}`);
-        doc.font('Helvetica').text(`Payment Status: ${booking.payment_status}`);
+        doc.fontSize(10).text('Payment Details', { underline: true });
+        doc.fontSize(8).text(`Total: Rs. ${booking.original_price}`);
+        if (booking.discount_amount > 0) {
+            doc.fontSize(8).text(`Discount: Rs. ${booking.discount_amount}`);
+        }
+        doc.fontSize(8).text(`Final Amount: Rs. ${booking.total_amount}`);
+        doc.fontSize(8).text(`Paid: Rs. ${booking.amount_paid} | Balance: Rs. ${booking.balance_amount}`);
         doc.moveDown();
 
+        // Payment History
+        if (payments.length > 0) {
+            doc.fontSize(10).text('Payment History', { underline: true });
+            payments.forEach(p => {
+                doc.fontSize(8).text(`${p.amount} rs via ${p.payment_mode} on ${p.payment_date} by ${p.username || 'N/A'}`);
+            });
+            doc.moveDown();
+        }
+
         // Footer
-        doc.fontSize(10).text('Thank you for your booking!', { align: 'center' });
+        doc.fontSize(8).text('Thank you for your booking!', { align: 'center' });
 
         doc.end();
 
@@ -552,18 +669,19 @@ router.get('/booking/:id/receipt.pdf', async (req, res) => {
 
 // Calculate price dynamically
 router.post('/bookings/calculate-price', authenticateToken, async (req, res) => {
-    const { sport_id, startTime, endTime, slots_booked } = req.body;
+    const { sport_id, startTime, endTime, slots_booked, accessories, discount_amount } = req.body;
 
     if (!sport_id || !startTime || !endTime) {
         return res.status(400).json({ message: 'sport_id, startTime, and endTime are required.' });
     }
 
     try {
-        const [sports] = await db.query('SELECT price FROM sports WHERE id = ?', [sport_id]);
+        const [sports] = await db.query('SELECT name, price, capacity FROM sports WHERE id = ?', [sport_id]);
         if (sports.length === 0) {
             return res.status(404).json({ message: 'Sport not found' });
         }
         const hourly_price = sports[0].price;
+        const capacity = sports[0].capacity;
 
         const parseTime = (timeStr) => {
             const [hours, minutes] = timeStr.split(':').map(Number);
@@ -571,30 +689,51 @@ router.post('/bookings/calculate-price', authenticateToken, async (req, res) => 
         };
         const durationInMinutes = parseTime(endTime) - parseTime(startTime);
 
-        if (durationInMinutes < 30) { // Only charge for 30 mins or more
-            return res.json({ total_price: 0 });
+        let court_price;
+        if (capacity > 1) {
+            court_price = 0;
+            if (durationInMinutes >= 30) { // Only charge for 30 mins or more
+                const num_of_hours = Math.floor(durationInMinutes / 60);
+                const remaining_minutes = durationInMinutes % 60;
+                
+                court_price = num_of_hours * hourly_price;
+                if (remaining_minutes >= 30) {
+                    court_price += hourly_price / 2;
+                }
+            }
+        } else {
+            court_price = (durationInMinutes / 60) * hourly_price;
         }
 
-        const num_of_hours = Math.floor(durationInMinutes / 60);
-        const remaining_minutes = durationInMinutes % 60;
-        
-        let total_price = num_of_hours * hourly_price;
-        if (remaining_minutes >= 30) {
-            total_price += hourly_price / 2;
-        }
 
         if (slots_booked > 1) {
-            total_price *= slots_booked;
+            court_price *= slots_booked;
         }
 
-        res.json({ total_price });
+        let accessories_total_price = 0;
+        if (accessories && accessories.length > 0) {
+            for (const acc of accessories) {
+                const [[accessoryData]] = await db.query('SELECT price FROM accessories WHERE id = ?', [acc.id]);
+                if (accessoryData && parseFloat(accessoryData.price) > 0) {
+                    accessories_total_price += parseFloat(accessoryData.price) * acc.quantity;
+                } else {
+                    // Fallback to price provided in the request body if DB price is not found or is 0
+                    accessories_total_price += parseFloat(acc.price) * acc.quantity;
+                }
+            }
+        }
+
+        let final_total_price = court_price + accessories_total_price;
+        if (discount_amount) {
+            final_total_price -= parseFloat(discount_amount);
+        }
+
+        res.json({ total_price: final_total_price });
 
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
-
-// Add a new booking
 router.post('/bookings', authenticateToken, async (req, res) => {
     const { court_id, customer_name, customer_contact, customer_email, date, startTime, endTime,
             payment_mode, payment_id, amount_paid, slots_booked, discount_amount, discount_reason, accessories } = req.body;
@@ -613,12 +752,13 @@ router.post('/bookings', authenticateToken, async (req, res) => {
         }
         const sport_id = courts[0].sport_id;
 
-        const [sports] = await connection.query('SELECT price, capacity FROM sports WHERE id = ?', [sport_id]);
+        const [sports] = await connection.query('SELECT name, price, capacity FROM sports WHERE id = ?', [sport_id]);
         if (sports.length === 0) {
             await connection.rollback();
             connection.release();
             return res.status(404).json({ message: 'Sport not found' });
         }
+        const sport_name = sports[0].name;
         const hourly_price = sports[0].price;
         const capacity = sports[0].capacity;
 
@@ -634,10 +774,28 @@ router.post('/bookings', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: 'End time must be after start time.' });
         }
 
-        let total_price = (durationInMinutes / 60) * hourly_price;
-        if (slots_booked > 1) {
-            total_price *= slots_booked;
+        let base_court_price;
+        if (capacity > 1) {
+            base_court_price = 0;
+            if (durationInMinutes >= 30) { // Only charge for 30 mins or more
+                const num_of_hours = Math.floor(durationInMinutes / 60);
+                const remaining_minutes = durationInMinutes % 60;
+                
+                base_court_price = num_of_hours * hourly_price;
+                if (remaining_minutes >= 30) {
+                    base_court_price += hourly_price / 2;
+                }
+            }
+        } else {
+            base_court_price = (durationInMinutes / 60) * hourly_price;
         }
+
+        if (slots_booked > 1) {
+            base_court_price *= slots_booked;
+        }
+
+        // Apply discount ONLY to the base court price
+        const final_court_price = base_court_price - (discount_amount || 0);
 
         let accessories_total_price = 0;
         if (accessories && accessories.length > 0) {
@@ -648,8 +806,16 @@ router.post('/bookings', authenticateToken, async (req, res) => {
                 }
             }
         }
-        total_price += accessories_total_price;
-        total_price -= discount_amount || 0;
+        
+        // Total price is discounted court price + accessories price
+        const total_price = final_court_price + accessories_total_price;
+
+        // Server-side validation: amount_paid cannot exceed total_price
+        if (parseFloat(amount_paid) > total_price) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ message: 'Amount paid cannot exceed total price.' });
+        }
 
         const balance_amount = total_price - amount_paid;
         let payment_status = balance_amount <= 0 ? 'Completed' : (amount_paid > 0 ? 'Received' : 'Pending');
@@ -694,6 +860,14 @@ router.post('/bookings', authenticateToken, async (req, res) => {
         );
         const bookingId = result.insertId;
 
+        // If there was an initial payment, add it to the payments table
+        if (amount_paid && parseFloat(amount_paid) > 0) {
+            await connection.query(
+                'INSERT INTO payments (booking_id, amount, payment_mode, created_by_user_id) VALUES (?, ?, ?, ?)',
+                [bookingId, amount_paid, payment_mode, created_by_user_id]
+            );
+        }
+
         if (accessories && accessories.length > 0) {
             for (const acc of accessories) {
                 const [[accessoryData]] = await connection.query('SELECT price FROM accessories WHERE id = ?', [acc.accessory_id]);
@@ -719,90 +893,289 @@ router.post('/bookings', authenticateToken, async (req, res) => {
 // Update an existing booking
 router.put('/bookings/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const fields = req.body;
+    const {
+        customer_name,
+        customer_contact,
+        date,
+        startTime,
+        endTime,
+        total_price,
+        is_rescheduled,
+        stagedPayments,
+        accessories,
+        discount_amount,
+        discount_reason
+    } = req.body;
+    const created_by_user_id = req.user.id;
 
+    let connection;
     try {
-        // 1. Get existing booking details to get court_id and to check if time/date changed
-        const [existingBookings] = await db.query('SELECT * FROM bookings WHERE id = ?', [id]);
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        // 1. Get existing booking
+        const [existingBookings] = await connection.query('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [id]);
         if (existingBookings.length === 0) {
+            await connection.rollback();
+            connection.release();
             return res.status(404).json({ message: 'Booking not found' });
         }
         const existingBooking = existingBookings[0];
 
-        // 2. Format new time slot for comparison and potential update
-        const formatTo12Hour = (time) => {
-            if(!time) return '';
-            let [hours, minutes] = time.split(':').map(Number);
-            if(isNaN(hours) || isNaN(minutes)) return '';
-            const ampm = hours >= 12 ? 'PM' : 'AM';
-            hours = hours % 12;
-            hours = hours ? hours : 12;
-            minutes = minutes < 10 ? '0' + minutes : minutes;
-            return `${hours}:${minutes} ${ampm}`;
-        };
-        
-        if (fields.is_rescheduled) {
-            const newTimeSlot = (fields.startTime && fields.endTime) ? `${formatTo12Hour(fields.startTime)} - ${formatTo12Hour(fields.endTime)}` : existingBooking.time_slot;
-            const newDate = fields.date ? new Date(fields.date).toISOString().slice(0, 10) : new Date(existingBooking.date).toISOString().slice(0, 10);
+        // 2. Format time and date for update, only if new times are provided
+        let newTimeSlot = existingBooking.time_slot;
+        if (startTime && endTime) {
+            newTimeSlot = `${formatTo12Hour(startTime)} - ${formatTo12Hour(endTime)}`;
+        }
+        const newDate = date ? new Date(date).toISOString().slice(0, 10) : new Date(existingBooking.date).toISOString().slice(0, 10);
 
-            const hasTimeChanged = newTimeSlot !== existingBooking.time_slot;
-            const hasDateChanged = newDate !== new Date(existingBooking.date).toISOString().slice(0, 10);
+        // 3. Conflict Checking if date or time has changed
+        const hasDateChanged = newDate !== new Date(existingBooking.date).toISOString().slice(0, 10);
+        const hasTimeChanged = newTimeSlot !== existingBooking.time_slot;
 
-            // 3. Conflict Checking
-            if (hasTimeChanged || hasDateChanged) {
-                const [conflictingBookings] = await db.query(
-                    'SELECT * FROM bookings WHERE court_id = ? AND date = ? AND id != ? AND status != ?',
-                    [existingBooking.court_id, newDate, id, 'Cancelled']
-                );
+        if (hasDateChanged || hasTimeChanged) {
+            // Get the capacity of the sport to determine which logic to use
+            const [[sportDetails]] = await connection.query('SELECT capacity FROM sports WHERE id = ?', [existingBooking.sport_id]);
+            const capacity = parseInt(sportDetails.capacity, 10);
 
-                const overlappingBookings = conflictingBookings.filter(booking => {
-                    const [existingStart, existingEnd] = booking.time_slot.split(' - ');
-                    return checkOverlap(newTimeSlot.split(' - ')[0], newTimeSlot.split(' - ')[1], existingStart.trim(), existingEnd.trim());
-                });
+            const [conflictingBookings] = await connection.query(
+                'SELECT * FROM bookings WHERE court_id = ? AND date = ? AND id != ? AND status != ?',
+                [existingBooking.court_id, newDate, id, 'Cancelled']
+            );
 
+            // Find all bookings that truly overlap with the new time
+            const overlappingBookings = conflictingBookings.filter(booking => {
+                const [existingStart, existingEnd] = booking.time_slot.split(' - ');
+                // Note: `startTime` and `endTime` are the new times from the request body
+                return checkOverlap(formatTo12Hour(startTime), formatTo12Hour(endTime), existingStart.trim(), existingEnd.trim());
+            });
+
+            if (capacity > 1) {
+                // For multi-capacity resources, check if there are enough slots
+                const totalSlotsInOverlap = overlappingBookings.reduce((total, b) => total + parseInt(b.slots_booked, 10), 0);
+                const slotsBeingMoved = parseInt(existingBooking.slots_booked, 10);
+                
+                if ((totalSlotsInOverlap + slotsBeingMoved) > capacity) {
+                    await connection.rollback();
+                    connection.release();
+                    const availableSlots = capacity - totalSlotsInOverlap;
+                    return res.status(409).json({ message: `The selected time slot conflicts with another booking. Only ${availableSlots} slots are available.` });
+                }
+            } else {
+                // For single-capacity resources, any overlap is a conflict
                 if (overlappingBookings.length > 0) {
+                    await connection.rollback();
+                    connection.release();
                     return res.status(409).json({ message: 'The selected time slot conflicts with another booking.' });
                 }
             }
-            fields.time_slot = newTimeSlot;
-            fields.date = newDate;
-        } else {
-            // If not rescheduling, do not update date and time related fields
-            delete fields.date;
-            delete fields.time_slot;
         }
 
-        // 4. Prepare fields for dynamic update
-        delete fields.id;
-        delete fields.court_id; // Should not be changed
-        delete fields.sport_id; // Should not be changed
-        delete fields.created_by_user_id; // Should not be changed
-        delete fields.accessories; 
-        delete fields.court_name;
-        delete fields.sport_name;
-        delete fields.original_price;
-        delete fields.total_amount;
-        delete fields.created_by_user;
-        delete fields.startTime;
-        delete fields.endTime;
+        // 4. Handle accessories
+        if (accessories) {
+            // a. Delete existing accessories for this booking
+            await connection.query('DELETE FROM booking_accessories WHERE booking_id = ?', [id]);
 
-        const fieldEntries = Object.entries(fields).filter(([, value]) => value !== undefined);
-        if (fieldEntries.length === 0) {
-            return res.status(400).json({ message: 'No fields to update' });
+            // b. Insert new accessories
+            for (const acc of accessories) {
+                const [[accessoryData]] = await connection.query('SELECT price FROM accessories WHERE id = ?', [acc.id]);
+                if (accessoryData) {
+                    await connection.query('INSERT INTO booking_accessories (booking_id, accessory_id, quantity, price_at_booking) VALUES (?, ?, ?, ?)', [id, acc.id, acc.quantity, accessoryData.price]);
+                }
+            }
         }
 
-        const setClause = fieldEntries.map(([key]) => `${key} = ?`).join(', ');
-        const values = fieldEntries.map(([, value]) => value);
+        // 5. Insert staged payments
+        if (stagedPayments && stagedPayments.length > 0) {
+            for (const payment of stagedPayments) {
+                await connection.query(
+                    'INSERT INTO payments (booking_id, amount, payment_mode, payment_id, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
+                    [id, payment.amount, payment.payment_mode, payment.payment_id, created_by_user_id]
+                );
+            }
+        }
 
-        // 5. Execute update
-        const sql = `UPDATE bookings SET ${setClause} WHERE id = ?`;
-        await db.query(sql, [...values, id]);
+        // 6. Recalculate payment totals from the database
+        const [payments] = await connection.query('SELECT SUM(amount) as total_paid FROM payments WHERE booking_id = ?', [id]);
+        const total_paid = payments[0].total_paid || 0;
+
+        const final_total_price = parseFloat(total_price);
+
+        // SERVER-SIDE VALIDATION: Prevent total from being less than amount paid
+        if (final_total_price < total_paid) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ message: 'Cannot remove/update items where the total amount would be less than the amount already paid.' });
+        }
+        
+        const final_balance_amount = final_total_price - total_paid;
+
+        let final_payment_status = 'Pending';
+        if (final_balance_amount <= 0) {
+            final_payment_status = 'Completed';
+        } else if (total_paid > 0) {
+            final_payment_status = 'Received';
+        }
+        
+        const updateFields = {
+            customer_name,
+            customer_contact,
+            date: newDate,
+            time_slot: newTimeSlot,
+            total_price: final_total_price,
+            amount_paid: total_paid, // Use server-calculated total
+            balance_amount: final_balance_amount, // Use server-calculated balance
+            payment_status: final_payment_status,
+            is_rescheduled: is_rescheduled || existingBooking.is_rescheduled,
+            discount_amount: discount_amount,
+            discount_reason: discount_reason
+        };
+
+        // 7. Execute booking update
+        const sql = 'UPDATE bookings SET ? WHERE id = ?';
+        await connection.query(sql, [updateFields, id]);
+
+        await connection.commit();
         sendEventsToAll({ message: 'bookings_updated' });
-        res.json({ success: true, message: 'Booking updated successfully' });
+
+        // 8. Fetch and return the fully updated booking
+        const [updatedBookingRows] = await connection.query(
+            `SELECT 
+                b.*, 
+                c.name as court_name, 
+                s.name as sport_name,
+                (b.total_price + b.discount_amount) as original_price,
+                b.total_price as total_amount,
+                u.username as created_by_user,
+                DATE_FORMAT(b.date, '%Y-%m-%d') as date,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', a.id, 'name', a.name, 'quantity', ba.quantity, 'price', ba.price_at_booking)), ']')
+                    FROM booking_accessories ba
+                    JOIN accessories a ON ba.accessory_id = a.id
+                    WHERE ba.booking_id = b.id
+                ) as accessories,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', p.id, 'amount', p.amount, 'payment_mode', p.payment_mode, 'payment_date', p.payment_date, 'username', u.username, 'payment_id', p.payment_id)), ']')
+                    FROM payments p
+                    LEFT JOIN users u ON p.created_by_user_id = u.id
+                    WHERE p.booking_id = b.id
+                ) as payments
+            FROM bookings b 
+            JOIN courts c ON b.court_id = c.id
+            JOIN sports s ON b.sport_id = s.id
+            LEFT JOIN users u ON b.created_by_user_id = u.id
+            WHERE b.id = ?`,
+            [id]
+        );
+
+        const updatedBooking = updatedBookingRows[0];
+        updatedBooking.accessories = updatedBooking.accessories ? JSON.parse(updatedBooking.accessories) : [];
+        updatedBooking.payments = updatedBooking.payments ? JSON.parse(updatedBooking.payments) : [];
+
+        res.json({ success: true, message: 'Booking updated successfully', booking: updatedBooking });
 
     } catch (err) {
+        if (connection) await connection.rollback();
         console.error("Error updating booking:", err);
         res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Extend an existing booking
+router.post('/bookings/:id/extend', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { extend_duration } = req.body; // in minutes
+
+    if (!extend_duration) {
+        return res.status(400).json({ message: 'Extend duration is required' });
+    }
+
+    let connection;
+    try {
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        // Get existing booking
+        const [bookings] = await connection.query('SELECT * FROM bookings WHERE id = ? FOR UPDATE', [id]);
+        if (bookings.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+        const booking = bookings[0];
+
+        // Get sport details for price calculation
+        const [sports] = await connection.query('SELECT price FROM sports WHERE id = ?', [booking.sport_id]);
+        if (sports.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: 'Sport not found' });
+        }
+        const hourly_price = sports[0].price;
+
+        // Calculate new end time
+        const [startTimeStr, endTimeStr] = booking.time_slot.split(' - ');
+        const to24Hour = (timeStr) => {
+            let [time, modifier] = timeStr.split(' ');
+            let [hours, minutes] = time.split(':').map(Number);
+            if (modifier === 'PM' && hours < 12) hours += 12;
+            if (modifier === 'AM' && hours === 12) hours = 0;
+            return { hours, minutes };
+        };
+
+        const endTime24 = to24Hour(endTimeStr);
+        const bookingDate = new Date(booking.date); // Use booking's date
+        bookingDate.setHours(endTime24.hours, endTime24.minutes, 0, 0);
+        bookingDate.setMinutes(bookingDate.getMinutes() + extend_duration);
+
+        const newEndTime = bookingDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+        // Check for conflicts
+        const newTimeSlotForCheck = `${startTimeStr} - ${newEndTime}`;
+        const [conflictingBookings] = await connection.query(
+            'SELECT * FROM bookings WHERE court_id = ? AND date = ? AND id != ? AND status != ?',
+            [booking.court_id, booking.date, id, 'Cancelled']
+        );
+
+        const isOverlapping = conflictingBookings.some(b => {
+            const [existingStart, existingEnd] = b.time_slot.split(' - ');
+            return checkOverlap(newTimeSlotForCheck.split(' - ')[0], newTimeSlotForCheck.split(' - ')[1], existingStart.trim(), existingEnd.trim());
+        });
+
+        if (isOverlapping) {
+            await connection.rollback();
+            return res.status(409).json({ message: 'The extended time slot conflicts with another booking.' });
+        }
+
+        // Calculate new price
+        const newTimeSlot = `${startTimeStr} - ${newEndTime}`;
+        
+        const startTime24 = to24Hour(startTimeStr);
+        const startDate = new Date(booking.date);
+        startDate.setHours(startTime24.hours, startTime24.minutes, 0, 0);
+
+        const durationInMinutes = (bookingDate.getTime() - startDate.getTime()) / (1000 * 60);
+        
+        const new_total_price = (durationInMinutes / 60) * hourly_price;
+        const new_balance_amount = new_total_price - booking.amount_paid;
+        const payment_status = new_balance_amount <= 0 ? 'Completed' : 'Pending';
+
+        // Update booking
+        await connection.query(
+            'UPDATE bookings SET time_slot = ?, total_price = ?, balance_amount = ?, payment_status = ? WHERE id = ?',
+            [newTimeSlot, new_total_price, new_balance_amount, payment_status, id]
+        );
+
+        await connection.commit();
+        sendEventsToAll({ message: 'bookings_updated' });
+        res.json({ success: true, message: 'Booking extended successfully' });
+
+    } catch (err) {
+        if (connection) await connection.rollback();
+        console.error("Error extending booking:", err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
@@ -832,6 +1205,113 @@ router.put('/bookings/:id/payment', authenticateToken, async (req, res) => {
     }
 });
 
+// Add a new payment to a booking
+router.post('/bookings/:id/payments', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { amount, payment_mode, new_total_price, endTime, payment_id } = req.body;
+    const created_by_user_id = req.user.id;
+
+    if (!amount || !payment_mode) {
+        return res.status(400).json({ message: 'Amount and payment mode are required' });
+    }
+
+    let connection;
+    try {
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        // 0. If a new total price is provided (e.g., from an extension), update it first.
+        if (new_total_price !== undefined) {
+            await connection.query('UPDATE bookings SET total_price = ? WHERE id = ?', [new_total_price, id]);
+        }
+
+        // If endTime is provided, update the time_slot
+        if (endTime) {
+            const [existingBooking] = await connection.query('SELECT time_slot FROM bookings WHERE id = ?', [id]);
+            const [startTime] = existingBooking[0].time_slot.split(' - ');
+            const newTimeSlot = `${startTime} - ${formatTo12Hour(endTime)}`;
+            await connection.query('UPDATE bookings SET time_slot = ? WHERE id = ?', [newTimeSlot, id]);
+        }
+
+        // 1. Add the new payment
+        await connection.query(
+            'INSERT INTO payments (booking_id, amount, payment_mode, created_by_user_id, payment_id) VALUES (?, ?, ?, ?, ?)',
+            [id, amount, payment_mode, created_by_user_id, payment_id]
+        );
+
+        // 2. Recalculate total amount paid
+        const [payments] = await connection.query('SELECT SUM(amount) as total_paid FROM payments WHERE booking_id = ?', [id]);
+        const total_paid = payments[0].total_paid || 0;
+
+        // 3. Get booking total price (which is now up-to-date)
+        const [bookings] = await connection.query('SELECT total_price FROM bookings WHERE id = ?', [id]);
+        if (bookings.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+        const total_price = bookings[0].total_price;
+
+        // 4. Update the booking with new payment totals
+        const balance_amount = total_price - total_paid;
+        const payment_status = balance_amount <= 0 ? 'Completed' : 'Received';
+
+        await connection.query(
+            'UPDATE bookings SET amount_paid = ?, balance_amount = ?, payment_status = ? WHERE id = ?',
+            [total_paid, balance_amount, payment_status, id]
+        );
+
+        await connection.commit();
+
+        // Fetch the complete updated booking to return to the client
+        const [updatedBookingRows] = await connection.query(
+            `SELECT 
+                b.*, 
+                b.time_slot, -- Explicitly select time_slot to ensure it's not lost
+                c.name as court_name, 
+                s.name as sport_name,
+                (b.total_price + b.discount_amount) as original_price,
+                b.total_price as total_amount,
+                u.username as created_by_user,
+                DATE_FORMAT(b.date, '%Y-%m-%d') as date,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', a.id, 'name', a.name, 'quantity', ba.quantity, 'price', ba.price_at_booking)), ']')
+                    FROM booking_accessories ba
+                    JOIN accessories a ON ba.accessory_id = a.id
+                    WHERE ba.booking_id = b.id
+                ) as accessories,
+                (
+                    SELECT CONCAT('[', GROUP_CONCAT(JSON_OBJECT('id', p.id, 'amount', p.amount, 'payment_mode', p.payment_mode, 'payment_date', p.payment_date, 'username', u.username, 'payment_id', p.payment_id)), ']')
+                    FROM payments p
+                    LEFT JOIN users u ON p.created_by_user_id = u.id
+                    WHERE p.booking_id = b.id
+                ) as payments
+            FROM bookings b 
+            JOIN courts c ON b.court_id = c.id
+            JOIN sports s ON b.sport_id = s.id
+            LEFT JOIN users u ON b.created_by_user_id = u.id
+            WHERE b.id = ?`,
+            [id]
+        );
+
+        const updatedBooking = updatedBookingRows[0];
+
+        // Parse accessories and payments
+        updatedBooking.accessories = updatedBooking.accessories ? JSON.parse(updatedBooking.accessories) : [];
+        updatedBooking.payments = updatedBooking.payments ? JSON.parse(updatedBooking.payments) : [];
+
+        sendEventsToAll({ message: 'bookings_updated' });
+        res.json({ success: true, message: 'Payment added successfully', booking: updatedBooking });
+
+    } catch (err) {
+        if (connection) await connection.rollback();
+        console.error("Error adding payment:", err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 // Cancel a booking
 router.put('/bookings/:id/cancel', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
@@ -845,13 +1325,12 @@ router.put('/bookings/:id/cancel', authenticateToken, isAdmin, async (req, res) 
 });
 
 // Update court status
-router.put('/courts/:id/status', authenticateToken, isAdmin, async (req, res) => {
+router.put('/courts/:id/status', authenticateToken, isPrivilegedUser, async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
     try {
         await db.query('UPDATE courts SET status = ? WHERE id = ?', [status, id]);
-        req.io.emit('courts_updated');
-        sendEventsToAll({ message: 'bookings_updated' });
+        sendEventsToAll({ message: 'courts_updated' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -860,12 +1339,18 @@ router.put('/courts/:id/status', authenticateToken, isAdmin, async (req, res) =>
 
 // Add a new sport
 router.post('/sports', authenticateToken, isAdmin, async (req, res) => {
-    const { name, price } = req.body;
+    const { name, price, capacity } = req.body;
     if (!name || price === undefined) {
         return res.status(400).json({ message: 'Sport name and price are required' });
     }
+    if (parseFloat(price) < 0) {
+        return res.status(400).json({ message: 'Price cannot be negative' });
+    }
+    if (capacity !== undefined && parseInt(capacity) <= 0) {
+        return res.status(400).json({ message: 'Capacity must be a positive number' });
+    }
     try {
-        const [result] = await db.query('INSERT INTO sports (name, price) VALUES (?, ?)', [name, price]);
+        const [result] = await db.query('INSERT INTO sports (name, price, capacity) VALUES (?, ?, ?)', [name, price, capacity || 1]);
         res.json({ success: true, sportId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -875,12 +1360,18 @@ router.post('/sports', authenticateToken, isAdmin, async (req, res) => {
 // Update sport price
 router.put('/sports/:id', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
-    const { price } = req.body;
+    const { price, capacity } = req.body;
     if (price === undefined) {
         return res.status(400).json({ message: 'Price is required' });
     }
+    if (parseFloat(price) < 0) {
+        return res.status(400).json({ message: 'Price cannot be negative' });
+    }
+    if (capacity !== undefined && parseInt(capacity) <= 0) {
+        return res.status(400).json({ message: 'Capacity must be a positive number' });
+    }
     try {
-        await db.query('UPDATE sports SET price = ? WHERE id = ?', [price, id]);
+        await db.query('UPDATE sports SET price = ?, capacity = ? WHERE id = ?', [price, capacity || 1, id]);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -897,6 +1388,9 @@ router.post('/courts', authenticateToken, isAdmin, async (req, res) => {
         const [result] = await db.query('INSERT INTO courts (name, sport_id) VALUES (?, ?)', [name, sport_id]);
         res.json({ success: true, courtId: result.insertId });
     } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ message: 'Court name already exists' });
+        }
         res.status(500).json({ error: err.message });
     }
 });
@@ -938,8 +1432,13 @@ router.post('/accessories', authenticateToken, isAdmin, async (req, res) => {
     if (!name || price === undefined) {
         return res.status(400).json({ message: 'Accessory name and price are required' });
     }
+    if (parseFloat(price) < 0) {
+        return res.status(400).json({ message: 'Price cannot be negative' });
+    }
+
     try {
         const [result] = await db.query('INSERT INTO accessories (name, price) VALUES (?, ?)', [name, price]);
+        sendEventsToAll({ message: 'accessories_updated' });
         res.json({ success: true, accessoryId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -952,8 +1451,12 @@ router.put('/accessories/:id', authenticateToken, isAdmin, async (req, res) => {
     if (!name || price === undefined) {
         return res.status(400).json({ message: 'Accessory name and price are required' });
     }
+    if (parseFloat(price) < 0) {
+        return res.status(400).json({ message: 'Price cannot be negative' });
+    }
     try {
         await db.query('UPDATE accessories SET name = ?, price = ? WHERE id = ?', [name, price, id]);
+        sendEventsToAll({ message: 'accessories_updated' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -964,6 +1467,7 @@ router.delete('/accessories/:id', authenticateToken, isAdmin, async (req, res) =
     const { id } = req.params;
     try {
         await db.query('DELETE FROM accessories WHERE id = ?', [id]);
+        sendEventsToAll({ message: 'accessories_updated' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -984,20 +1488,78 @@ router.get('/analytics/summary', authenticateToken, isAdmin, async (req, res) =>
         }
 
         const [[{ total_bookings }]] = await db.query(`SELECT COUNT(*) as total_bookings FROM bookings WHERE status != ?${dateFilter}`, ['Cancelled', ...queryParams]);
-        const [[{ total_revenue }]] = await db.query(`SELECT SUM(amount_paid) as total_revenue FROM bookings WHERE status != ?${dateFilter}`, ['Cancelled', ...queryParams]);
+        const [[{ active_total_amount }]] = await db.query(`SELECT SUM(total_price) as active_total_amount FROM bookings WHERE status != ?${dateFilter}`, ['Cancelled', ...queryParams]);
+        const [[{ amount_received }]] = await db.query(`SELECT SUM(amount_paid) as amount_received FROM bookings WHERE 1=1${dateFilter}`, [...queryParams]);
         const [[{ total_cancellations }]] = await db.query(`SELECT COUNT(*) as total_cancellations FROM bookings WHERE status = ?${dateFilter}`, ['Cancelled', ...queryParams]);
         const [[{ total_sports }]] = await db.query('SELECT COUNT(*) as total_sports FROM sports');
         const [[{ total_courts }]] = await db.query('SELECT COUNT(*) as total_courts FROM courts');
         const [[{ total_discount }]] = await db.query(`SELECT SUM(discount_amount) as total_discount FROM bookings WHERE status != ?${dateFilter}`, ['Cancelled', ...queryParams]);
+        const [[{ cancelled_revenue }]] = await db.query(`SELECT SUM(amount_paid) as cancelled_revenue FROM bookings WHERE status = ?${dateFilter}`, ['Cancelled', ...queryParams]);
+
+        const [[{ amount_pending }]] = await db.query(`SELECT COALESCE(SUM(balance_amount), 0) as amount_pending FROM bookings WHERE balance_amount > 0 AND status = 'Booked'${dateFilter}`, [...queryParams]);
+
+        const total_amount = (parseFloat(active_total_amount) || 0) + (parseFloat(cancelled_revenue) || 0);
 
         res.json({
             total_bookings,
-            total_revenue,
+            total_amount,
+            amount_received,
+            amount_pending: parseFloat(amount_pending) || 0,
             total_cancellations,
             total_sports,
             total_courts,
-            total_discount
+            total_discount,
+            cancelled_revenue
         });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Analytics: Desk Summary
+router.get('/analytics/desk-summary', authenticateToken, isPrivilegedUser, async (req, res) => {
+    try {
+        const { date } = req.query; // Optional: filter by date
+
+        let whereClauses = ["status != 'Cancelled'"];
+        let queryParams = [];
+
+        if (date) {
+            whereClauses.push('date = ?');
+            queryParams.push(date);
+        }
+
+        const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+        const [[{ total_bookings }]] = await db.query(`SELECT COUNT(*) as total_bookings FROM bookings ${whereString}`, queryParams);
+        
+        // Total revenue should probably include revenue from cancelled bookings, so we query it separately.
+        const totalRevenueParams = date ? [date] : [];
+        const totalRevenueFilter = date ? 'WHERE date = ?' : '';
+        const [[{ total_revenue }]] = await db.query(`SELECT COALESCE(SUM(amount_paid), 0) as total_revenue FROM bookings ${totalRevenueFilter}`, totalRevenueParams);
+
+        const [[{ pending_amount }]] = await db.query(`SELECT COALESCE(SUM(balance_amount), 0) as pending_amount FROM bookings ${whereString} AND balance_amount > 0`, queryParams);
+        
+        const paymentModeQuery = `
+            SELECT p.payment_mode, SUM(p.amount) as total
+            FROM payments p
+            ${date ? 'JOIN bookings b ON p.booking_id = b.id WHERE b.date = ?' : ''}
+            GROUP BY p.payment_mode
+        `;
+        const paymentModeParams = date ? [date] : [];
+        const [revenue_by_mode_rows] = await db.query(paymentModeQuery, paymentModeParams);
+        const revenue_by_mode = revenue_by_mode_rows.map(row => ({
+            ...row,
+            total: parseFloat(row.total) || 0
+        }));
+
+        res.json({
+            total_bookings: total_bookings || 0,
+            total_revenue: parseFloat(total_revenue) || 0,
+            pending_amount: parseFloat(pending_amount) || 0,
+            revenue_by_mode: revenue_by_mode || [],
+        });
+
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1121,16 +1683,17 @@ router.get('/analytics/revenue-by-payment-mode', authenticateToken, isAdmin, asy
         let queryParams = ['Cancelled'];
 
         if (startDate && endDate) {
-            dateFilter = ' AND date BETWEEN ? AND ?';
+            dateFilter = ' AND b.date BETWEEN ? AND ?';
             queryParams.push(startDate, endDate);
         }
 
         const [rows] = await db.query(`
-            SELECT payment_mode, SUM(amount_paid) as revenue
-            FROM bookings
-            WHERE status != ?
+            SELECT p.payment_mode, SUM(p.amount) as revenue
+            FROM payments p
+            JOIN bookings b ON p.booking_id = b.id
+            WHERE b.status != ?
             ${dateFilter}
-            GROUP BY payment_mode
+            GROUP BY p.payment_mode
             ORDER BY revenue DESC
         `, queryParams);
         res.json(rows);
@@ -1366,7 +1929,7 @@ Thank you for booking with ARC SportsZone!
 
 // Check for booking conflicts in real-time
 router.post('/bookings/check-clash', authenticateToken, async (req, res) => {
-    const { court_id, date, startTime, endTime, bookingId } = req.body;
+    const { court_id, date, startTime, endTime, bookingId, slots_booked } = req.body;
 
     if (!court_id || !date || !startTime || !endTime) {
         return res.status(400).json({ message: 'court_id, date, startTime, and endTime are required.' });
@@ -1381,45 +1944,45 @@ router.post('/bookings/check-clash', authenticateToken, async (req, res) => {
 
         const [conflictingBookings] = await db.query(query, params);
 
-        const toMinutes = (timeStr) => {
-            const [time, modifier] = timeStr.split(' ');
-            let [hours, minutes] = time.split(':').map(Number);
-            if (modifier === 'PM' && hours < 12) hours += 12;
-            if (modifier === 'AM' && hours === 12) hours = 0;
-            return hours * 60 + minutes;
-        };
+        const newStart = formatTo12Hour(startTime);
+        const newEnd = formatTo12Hour(endTime);
 
-        const checkOverlap = (startA, endA, startB, endB) => {
-            const startAMin = toMinutes(startA);
-            const endAMin = toMinutes(endA);
-            const startBMin = toMinutes(startB);
-            const endBMin = toMinutes(endB);
-            return startAMin < endBMin && endAMin > startBMin;
-        };
+        // Get sport_id from court_id
+        const [[courtDetails]] = await db.query('SELECT sport_id FROM courts WHERE id = ?', [court_id]);
+        if (!courtDetails) {
+            return res.status(404).json({ message: 'Court not found' });
+        }
+        const sport_id = courtDetails.sport_id;
 
-        const formatTo12Hour = (time) => {
-            let [hours, minutes] = time.split(':').map(Number);
-            const ampm = hours >= 12 ? 'PM' : 'AM';
-            hours = hours % 12;
-            hours = hours ? hours : 12;
-            minutes = minutes < 10 ? '0' + minutes : minutes;
-            return `${hours}:${minutes} ${ampm}`;
-        };
+        // Get capacity for the sport
+        const [[sportDetails]] = await db.query('SELECT capacity FROM sports WHERE id = ?', [sport_id]);
+        const capacity = parseInt(sportDetails.capacity, 10);
 
-        const newTimeSlot = `${formatTo12Hour(startTime)} - ${formatTo12Hour(endTime)}`;
-        const [newStart, newEnd] = newTimeSlot.split(' - ');
-
-        const isOverlapping = conflictingBookings.some(booking => {
+        // Filter conflicting bookings to only those that actually overlap
+        const overlappingBookings = conflictingBookings.filter(booking => {
             const [existingStart, existingEnd] = booking.time_slot.split(' - ');
-            return checkOverlap(newStart.trim(), newEnd.trim(), existingStart.trim(), existingEnd.trim());
+            return checkOverlap(newStart, newEnd, existingStart.trim(), existingEnd.trim());
         });
 
-        if (isOverlapping) {
-            return res.status(200).json({ is_clashing: true, message: 'The selected time slot conflicts with another booking.' });
-        } else {
-            return res.status(200).json({ is_clashing: false, message: 'The selected time slot is available.' });
-        }
+        if (capacity > 1) {
+            // Multi-capacity logic
+            const totalSlotsInOverlap = overlappingBookings.reduce((total, b) => total + parseInt(b.slots_booked, 10), 0);
+            const slotsForNewBooking = parseInt(slots_booked || 1, 10); // Use slots_booked from req.body, default to 1
 
+            if ((totalSlotsInOverlap + slotsForNewBooking) > capacity) {
+                const availableSlots = capacity - totalSlotsInOverlap;
+                return res.status(200).json({ is_clashing: true, message: `Not enough slots available. Only ${availableSlots} slots left.` });
+            } else {
+                return res.status(200).json({ is_clashing: false, message: 'The selected time slot is available.' });
+            }
+        } else {
+            // Single-capacity logic
+            if (overlappingBookings.length > 0) {
+                return res.status(200).json({ is_clashing: true, message: 'The selected time slot conflicts with another booking.' });
+            } else {
+                return res.status(200).json({ is_clashing: false, message: 'The selected time slot is available.' });
+            }
+        }
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
